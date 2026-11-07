@@ -1,0 +1,10 @@
+{
+  "name": "ipotrack-data",
+  "private": true,
+  "type": "module",
+  "description": "IPOTrack günlük veri ve bildirim görevleri (GitHub Actions)",
+  "dependencies": {
+    "firebase-admin": "13.5.0",
+    "linkedom": "0.18.12"
+  }
+}
