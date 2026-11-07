@@ -23,12 +23,12 @@ async function getJson(url) {
 }
 
 // Önce toplu (spark, 20'li), olmazsa tek tek (chart)
-async function series(codes) {
+async function series(codes, range = '1y') {
   const out = {};
   for (let i = 0; i < codes.length; i += 20) {
     const batch = codes.slice(i, i + 20);
     const syms = batch.map(c => c + '.IS').join(',');
-    const j = await getJson('https://query1.finance.yahoo.com/v7/finance/spark?symbols=' + encodeURIComponent(syms) + '&range=1y&interval=1d');
+    const j = await getJson('https://query1.finance.yahoo.com/v7/finance/spark?symbols=' + encodeURIComponent(syms) + '&range=' + range + '&interval=1d');
     for (const r of j?.spark?.result ?? []) {
       const resp = r.response?.[0];
       const t = resp?.timestamp, c = resp?.indicators?.quote?.[0]?.close;
@@ -40,7 +40,7 @@ async function series(codes) {
   }
   for (const code of codes) {
     if (out[code]?.length) continue;
-    const j = await getJson('https://query2.finance.yahoo.com/v8/finance/chart/' + code + '.IS?range=1y&interval=1d');
+    const j = await getJson('https://query2.finance.yahoo.com/v8/finance/chart/' + code + '.IS?range=' + range + '&interval=1d');
     const r = j?.chart?.result?.[0];
     const t = r?.timestamp, c = r?.indicators?.quote?.[0]?.close;
     if (t && c) out[code] = t.map((x, k) => [x * 1000, c[k]]).filter(p => typeof p[1] === 'number');
@@ -73,9 +73,12 @@ function stat(points) {
   };
 }
 
+
+
 const data = await series(CODES);
 const stocks = {};
 for (const code of CODES) { const s = stat(data[code]); if (s) stocks[code] = s; }
+
 const count = Object.keys(stocks).length;
 console.log('hisse:', count, '/', CODES.length);
 if (count < CODES.length * 0.5) { console.error('Çok az veri geldi, dosya güncellenmedi.'); process.exit(1); }

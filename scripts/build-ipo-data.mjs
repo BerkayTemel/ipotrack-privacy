@@ -3,8 +3,12 @@
 //                       büyüklük, aracı kurum) + Yahoo'dan ilk işlem günü, tavan serisi, getiri
 //  • data/drafts.json : SPK'nın "İlk Halka Arz", GYO ve GSYO başvuru listeleri
 //  • data/dividends.json : KAP "Kar Payı Dağıtımı" bildirimleri (son 150 gün)
+//  • data/calendar.json  : bedelsiz / bedelli sermaye artırımı ve bilanço takvimi (halkarz.com)
+//  Arşiv 2023'ten bugüne halkarz.com sayfalarıyla tamamlanır (kişi başı lot, dağıtım
+//  yöntemi, katılım endeksi); KAP'ta bulunan resmi rakamlar önceliklidir.
 // GitHub Actions her iş günü akşamı çalıştırır.
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
+import { listPages, ipoDetail, calendar } from './lib-halkarz.mjs';
 
 const UA = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36',
@@ -60,6 +64,14 @@ const field = (t, label) => {
   const m = t.match(new RegExp(label.replace(/[()]/g, '\\$&') + '\\s*([0-9][0-9.]*(?:,[0-9]+)?)'));
   return m ? N(m[1]) : null;
 };
+
+// "2,2 Milyar TL" → 2200000000
+function sizeTl(s) {
+  const m = (s || '').match(/([\d.,]+)\s*(Milyar|Milyon)/i);
+  if (!m) return null;
+  return Math.round(N(m[1]) * (/milyar/i.test(m[2]) ? 1e9 : 1e6));
+}
+const prevFile = (f) => { try { return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null; } catch { return null; } };
 
 // ── Yahoo: ilk işlem günü, tavan serisi, getiri ─────────────────────────────
 async function chart(code, fromSec) {
@@ -141,9 +153,42 @@ async function buildIpos() {
       foreign: field(t, 'Yurt Dışı Kurumsal Yatırımcı Sayısı') ?? null,
     };
   }
-  const items = Object.values(byCode);
+  // halkarz.com arşivi (2023 → bugün), önceki dosyadan önbellekli
+  const prevItems = (prevFile('data/ipos.json')?.items || []).filter(i => i.slug);
+  const prevBySlug = Object.fromEntries(prevItems.map(i => [i.slug, i]));
+  const hz = [];
+  for (let y = new Date().getUTCFullYear(); y >= 2023; y--) {
+    let list = [];
+    try { list = await listPages(`https://halkarz.com/k/halka-arz/${y}/`); } catch {}
+    for (const li of list) {
+      const old = prevBySlug[li.slug];
+      const fresh = old && old.retail && old.listDate && old.resultDate && (Date.now() - new Date(old.resultDate).getTime()) > 45 * 86400000;
+      if (fresh) { hz.push(old); continue; }
+      const d = await ipoDetail(li, y).catch(() => null);
+      await sleep(350);
+      if (!d?.code) { if (old) hz.push(old); continue; }
+      hz.push({
+        code: CODE_FIX[d.code] || d.code, slug: d.slug,
+        title: d.name, resultDate: d.endDate, broker: d.broker || '',
+        shares: d.lots, size: sizeTl(d.size), price: d.price,
+        investors: d.totalParticipants ?? d.participants, retail: d.participants,
+        institutional: null, foreign: null,
+        lotsPerPerson: d.lotsPerPerson, method: d.method, katilim: d.katilim,
+        retailLots: d.retailLots, retailPct: d.retailPct, discount: d.discount, floatPct: d.floatPct, market: d.market,
+        hzListDate: d.listDate,
+      });
+    }
+  }
+  console.log('halkarz arşivi:', hz.length);
+  // Birleştir: KAP resmi rakamları halkarz kaydının üzerine yazar
+  const merged = {};
+  for (const h of hz) if (h.code && h.investors) merged[h.code] = h;
+  for (const k of Object.values(byCode)) merged[k.code] = { ...(merged[k.code] || {}), ...k, broker: k.broker || merged[k.code]?.broker };
+  const items = Object.values(merged);
   for (const it of items) {
-    const from = Math.floor(new Date(it.resultDate + 'T00:00:00Z').getTime() / 1000) - 86400;
+    const startIso = it.resultDate || it.hzListDate;
+    if (!startIso || !it.price) continue;
+    const from = Math.floor(new Date(startIso + 'T00:00:00Z').getTime() / 1000) - 86400;
     const pts = await chart(it.code, from);
     Object.assign(it, perf(it.price, pts));
     await sleep(300);
@@ -253,3 +298,12 @@ if (drafts.length > 20) {
   writeFileSync('data/drafts.json', JSON.stringify({ updatedAt: now, count: drafts.length, items: drafts, removed: history }));
   console.log('SPK başvuruları:', drafts.length, 'listeden çıkan:', removed.length);
 } else console.error('drafts.json güncellenmedi (', drafts.length, ')');
+
+// Bedelsiz / bedelli / bilanço takvimi
+try {
+  const cal = await calendar();
+  if (cal.bonus.length + cal.rights.length + cal.dividends.length > 0) {
+    writeFileSync('data/calendar.json', JSON.stringify({ updatedAt: now, source: 'halkarz.com', bonus: cal.bonus, rights: cal.rights, earnings: cal.earnings }));
+    console.log('takvim: bedelsiz', cal.bonus.length, 'bedelli', cal.rights.length, 'bilanço', cal.earnings.length);
+  }
+} catch (e) { console.error('takvim alınamadı', e.message); }
