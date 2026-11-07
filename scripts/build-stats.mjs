@@ -61,7 +61,11 @@ function stat(points) {
   const jan1 = Date.UTC(new Date(now).getUTCFullYear(), 0, 1);
   const ytdBase = points.filter(p => p[0] < jan1).pop()?.[1];
   const closes = points.map(p => p[1]);
+  // Devam eden tavan serisi (her gün ≥ %9,5 kapanış)
+  let t = 0;
+  for (let i = closes.length - 1; i > 0; i--) { if (closes[i] / closes[i - 1] - 1 >= 0.095) t++; else break; }
   return {
+    t,
     p: sig(last),
     w: pct(at(7)), m: pct(at(30)), m3: pct(at(91)), y: pct(at(365)), ytd: pct(ytdBase),
     h52: sig(Math.max(...closes)), l52: sig(Math.min(...closes)),
