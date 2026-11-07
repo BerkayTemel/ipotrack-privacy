@@ -14,11 +14,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: node scripts/build-stats.mjs
+      - name: Hisse istatistikleri
+        run: node scripts/build-stats.mjs
+        continue-on-error: true
+      - name: Halka arz sonuçları ve SPK başvuruları
+        run: node scripts/build-ipo-data.mjs
+        continue-on-error: true
       - name: Kaydet
         run: |
           git config user.name "ipotrack-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add data/stats.json
-          git diff --cached --quiet || git commit -m "Hisse istatistikleri güncellendi"
+          git add data/
+          git diff --cached --quiet || git commit -m "Piyasa verileri güncellendi"
           git push
