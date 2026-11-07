@@ -2,6 +2,7 @@
 //  • data/ipos.json   : KAP "Halka Arz Sonuçları" bildirimleri (katılımcı sayısı, fiyat,
 //                       büyüklük, aracı kurum) + Yahoo'dan ilk işlem günü, tavan serisi, getiri
 //  • data/drafts.json : SPK'nın "İlk Halka Arz", GYO ve GSYO başvuru listeleri
+//  • data/dividends.json : KAP "Kar Payı Dağıtımı" bildirimleri (son 150 gün)
 // GitHub Actions her iş günü akşamı çalıştırır.
 import { writeFileSync, mkdirSync, existsSync, readFileSync } from 'node:fs';
 
@@ -64,7 +65,7 @@ const field = (t, label) => {
 async function chart(code, fromSec) {
   const to = Math.floor(Date.now() / 1000) + 86400;
   for (const host of ['query1', 'query2']) {
-    const r = await get(`https://${host}.finance.yahoo.com/v8/finance/chart/${code}.IS?period1=${fromSec}&period2=${to}&interval=1d`);
+    const r = await get(`https://${host}.finance.yahoo.com/v8/finance/chart/${code}.IS?period1=${fromSec}&period2=${to}&interval=1d&events=split`);
     if (!r) continue;
     try {
       const j = await r.json();
@@ -72,16 +73,21 @@ async function chart(code, fromSec) {
       if (!res?.timestamp) continue;
       const c = res.indicators?.quote?.[0]?.close ?? [];
       const pts = res.timestamp.map((t, i) => [t * 1000, c[i]]).filter(p => typeof p[1] === 'number');
-      const live = res.meta?.regularMarketPrice;
-      if (live && pts.length) pts[pts.length - 1][1] = live;
+      // Bedelsiz/bölünme: Yahoo geçmiş fiyatları düzeltir → arz fiyatını da aynı oranda düzelt
+      let factor = 1;
+      for (const sp of Object.values(res.events?.splits ?? {})) {
+        if (sp?.numerator && sp?.denominator) factor *= sp.numerator / sp.denominator;
+      }
+      pts.factor = factor;
       return pts;
     } catch {}
   }
   return [];
 }
 
-function perf(price, pts) {
-  if (!price || !pts.length) return {};
+function perf(rawPrice, pts) {
+  if (!rawPrice || !pts.length) return {};
+  const price = rawPrice / (pts.factor || 1);
   let ceilings = 0, prev = price;
   for (const [, c] of pts) { if (c / prev - 1 >= 0.095) { ceilings++; prev = c; } else break; }
   const closes = pts.map(p => p[1]);
@@ -100,6 +106,7 @@ function perf(price, pts) {
     last: r2(last), ret: r2((last / price - 1) * 100),
     peak: r2(peak), peakRet: r2((peak / price - 1) * 100),
     days: pts.length,
+    ...(pts.factor && pts.factor !== 1 ? { splitFactor: r2(pts.factor) } : {}),
   };
 }
 
@@ -175,6 +182,51 @@ async function buildDrafts() {
   return out;
 }
 
+// ── KAP: Kar payı (temettü) ─────────────────────────────────────────────────
+const SUBJECT_DIVIDEND = '4028328d5988e2630159d5fb51c81fe6';
+const isoTr = d => (d ? d.split('.').reverse().join('-') : null);
+
+function parseDividend(t, code) {
+  const noCash = /Nakit Kar Payı Ödeme Şekli\s*Ödenmeyecek/.test(t);
+  const bonus = !/Pay Biçiminde Ödeme\s*Ödenmeyecek/.test(t) && /Pay Biçiminde Ödeme\s*\S/.test(t);
+  let gross = null, grossPct = null, stopaj = null, net = null;
+  const m = t.match(new RegExp(code + ',\\s*TR\\w+\\s+(?:Peşin|Taksitli)?\\s*([0-9.,]+)\\s+([0-9.,]+)\\s+([0-9.,]+)\\s+([0-9.,]+)'));
+  if (m) { gross = N(m[1]); grossPct = N(m[2]); stopaj = N(m[3]); net = N(m[4]); }
+  let exDate = null, payDate = null;
+  const k = t.indexOf('Kayıt Tarihi (4)');
+  if (k >= 0) {
+    const ds = t.slice(k + 16, k + 140).split('(1)')[0].match(/\d{2}\.\d{2}\.\d{4}/g) || [];
+    if (ds.length >= 4) { exDate = ds[1]; payDate = ds[2]; }
+    else if (ds.length >= 2) { exDate = ds[0]; payDate = ds[1]; }
+    else if (ds.length === 1) exDate = ds[0];
+  }
+  const gk = t.match(/Genel Kurul Tarihi\s*(\d{2}\.\d{2}\.\d{4})/);
+  return { cash: !noCash, bonus, gross, grossPct, stopaj, net, exDate: isoTr(exDate), payDate: isoTr(payDate), meeting: gk ? isoTr(gk[1]) : null };
+}
+
+async function buildDividends() {
+  const to = new Date();
+  const from = new Date(Date.now() - 150 * 86400000);
+  const list = await kapList(from.toISOString().slice(0, 10), to.toISOString().slice(0, 10), SUBJECT_DIVIDEND);
+  if (!Array.isArray(list)) return null;
+  const byCode = {};
+  // eskiden yeniye: yeni bildirim eksik alanları eskiden tamamlar
+  for (const d of list.slice().reverse()) {
+    const code = String(d.stockCodes || '').split(',')[0].trim().toUpperCase();
+    if (!code) continue;
+    const t = await kapText(d.disclosureIndex);
+    await sleep(250);
+    const p = parseDividend(t, code);
+    const sum = String(d.summary || '');
+    const status = /ödeme|ödendi|hak kullan/i.test(sum) && !/öneri/i.test(sum) ? 'odeme' : /genel kurul|onay|karar|sonuc|sonuç/i.test(sum) && !/öneri/i.test(sum) ? 'karar' : 'oneri';
+    const prevD = byCode[code] || {};
+    const merged = { ...prevD };
+    for (const [k, v] of Object.entries(p)) if (v !== null && v !== undefined) merged[k] = v;
+    byCode[code] = { ...merged, code, status, title: sum.trim(), date: isoTr(d.publishDate?.slice(0, 10)), kap: d.disclosureIndex };
+  }
+  return Object.values(byCode).filter(d => d.cash && d.gross).sort((a, b) => (a.exDate || '9999').localeCompare(b.exDate || '9999'));
+}
+
 // ── Çalıştır ────────────────────────────────────────────────────────────────
 const prev = (f) => { try { return existsSync(f) ? JSON.parse(readFileSync(f, 'utf8')) : null; } catch { return null; } };
 const now = new Date().toISOString();
@@ -184,6 +236,12 @@ if (ipos?.length) {
   writeFileSync('data/ipos.json', JSON.stringify({ updatedAt: now, count: ipos.length, items: ipos }));
   console.log('halka arz sonuçları:', ipos.length);
 } else console.error('ipos.json güncellenmedi');
+
+const divs = await buildDividends();
+if (divs?.length) {
+  writeFileSync('data/dividends.json', JSON.stringify({ updatedAt: now, count: divs.length, items: divs }));
+  console.log('temettü:', divs.length);
+} else console.error('dividends.json güncellenmedi');
 
 const drafts = await buildDrafts();
 if (drafts.length > 20) {
